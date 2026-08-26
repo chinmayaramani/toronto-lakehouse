@@ -30,9 +30,11 @@ metricflow==0.212.0
 more-itertools==10.8.0
 msgpack==1.2.1
 networkx==3.6.1
+numpy==2.5.2
 opentelemetry-api==1.44.0
 orderly-set==5.5.0
 packaging==26.3
+pandas==3.0.5
 parsedatetime==2.6
 pathspec==1.0.4
 protobuf==6.33.6
