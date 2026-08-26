@@ -1,11 +1,13 @@
 """
 STAGE 2: SILVER LAYER PROCESSING & QUARANTINE ENGINE (TO-Lakehouse)
-Objective: Standardize schemas, enforce data quality constraints,
-quarantine corrupt records, and persist clean data to a partitioned Delta Lake table.
+Objective: Enforce data quality validation, quarantine corrupt records,
+and perform an idempotent ACID MERGE (Upsert) into the partitioned Silver Delta table.
 """
 
+import os
 import pyspark
 from delta import configure_spark_with_delta_pip
+from delta.tables import DeltaTable
 from pyspark.sql.functions import (
     col,
     to_date,
@@ -31,41 +33,31 @@ def init_spark() -> pyspark.sql.SparkSession:
 
 
 def process_silver(
-    spark: pyspark.sql.SparkSession, bronze_path: str, silver_path: str, quarantine_path: str
+    spark: pyspark.sql.SparkSession,
+    bronze_path: str,
+    silver_path: str,
+    quarantine_path: str,
 ):
     print(f"📖 Reading raw Bronze Delta table from: {bronze_path}...")
     bronze_df = spark.read.format("delta").load(bronze_path)
 
-    # 1. Inspect raw column names (handling variations in municipal data naming conventions)
-    cols = bronze_df.columns
-    print(f"🔍 Discovered raw columns: {cols}")
-
-    # Standardize column selection dynamically
-    trip_id_col = next((c for c in cols if "id" in c.lower() and "trip" in c.lower() or c.lower() == "trip_id"), cols[0])
-    duration_col = next((c for c in cols if "duration" in c.lower()), cols[1])
-    start_time_col = next((c for c in cols if "start_time" in c.lower() or "start time" in c.lower()), cols[2])
-    end_time_col = next((c for c in cols if "end_time" in c.lower() or "end time" in c.lower()), cols[3])
-    start_station_col = next((c for c in cols if "start_station_id" in c.lower() or "from_station_id" in c.lower()), cols[4])
-    end_station_col = next((c for c in cols if "end_station_id" in c.lower() or "to_station_id" in c.lower()), cols[5])
-    user_type_col = next((c for c in cols if "user_type" in c.lower() or "user type" in c.lower()), cols[6])
-
-    # 2. Schema Standardization and Type Casting
+    # 1. Standardize types and build audit columns
     standardized_df = (
         bronze_df.select(
-            col(trip_id_col).cast("string").alias("trip_id"),
-            col(duration_col).cast("integer").alias("duration_seconds"),
-            to_timestamp(col(start_time_col)).alias("start_time"),
-            to_timestamp(col(end_time_col)).alias("end_time"),
-            col(start_station_col).cast("string").alias("start_station_id"),
-            col(end_station_col).cast("string").alias("end_station_id"),
-            col(user_type_col).cast("string").alias("user_type"),
+            col("Trip_Id").alias("trip_id"),
+            col("Trip_Duration").alias("duration_seconds"),
+            to_timestamp(col("Start_Time")).alias("start_time"),
+            to_timestamp(col("End_Time")).alias("end_time"),
+            col("Start_Station_Id").alias("start_station_id"),
+            col("End_Station_Id").alias("end_station_id"),
+            col("User_Type").alias("user_type"),
             col("ingestion_timestamp"),
         )
         .withColumn("trip_date", to_date(col("start_time")))
         .dropDuplicates(["trip_id"])
     )
 
-    # 3. Data Quality Validation Rules & Error Tagging
+    # 2. Data Quality Constraints & Quarantine Routing
     validated_df = standardized_df.withColumn(
         "error_reason",
         when(col("duration_seconds") <= 0, "INVALID_DURATION_NON_POSITIVE")
@@ -76,10 +68,10 @@ def process_silver(
         .otherwise(None),
     )
 
-    # Split Clean vs Corrupted Records
-    clean_df = validated_df.filter(col("error_reason").isNull()).drop("error_reason").withColumn(
-        "processed_timestamp", current_timestamp()
-    )
+    clean_df = validated_df.filter(col("error_reason").isNull()).drop(
+        "error_reason"
+    ).withColumn("processed_timestamp", current_timestamp())
+
     quarantine_df = validated_df.filter(col("error_reason").isNotNull()).withColumn(
         "quarantined_timestamp", current_timestamp()
     )
@@ -90,25 +82,35 @@ def process_silver(
     print(f"✅ Clean Silver Records: {clean_count:,}")
     print(f"⚠️  Quarantined Corrupt Records: {quarantine_count:,}")
 
-    # 4. Write Clean Records to Partitioned Silver Delta Table
-    print(f"💾 Writing partitioned Silver Delta Lake at: {silver_path}...")
-    (
-        clean_df.write.format("delta")
-        .mode("overwrite")
-        .partitionBy("trip_date")
-        .save(silver_path)
-    )
-
-    # 5. Write Quarantined Records for Data Quality Auditing
-    if quarantine_count > 0:
-        print(f"💾 Writing Quarantine Delta Lake at: {quarantine_path}...")
+    # 3. IDEMPOTENT ACID MERGE (UPSERT) INTO SILVER DELTA LAKE
+    if not DeltaTable.isDeltaTable(spark, silver_path):
+        print(f"🚀 Initializing Silver Delta Lake table at: {silver_path}...")
         (
-            quarantine_df.write.format("delta")
+            clean_df.write.format("delta")
             .mode("overwrite")
-            .save(quarantine_path)
+            .partitionBy("trip_date")
+            .save(silver_path)
+        )
+    else:
+        print(f"🔄 Performing ACID MERGE (Upsert) on target Silver table at: {silver_path}...")
+        target_delta = DeltaTable.forPath(spark, silver_path)
+        (
+            target_delta.alias("target")
+            .merge(
+                clean_df.alias("source"),
+                "target.trip_id = source.trip_id AND target.trip_date = source.trip_date",
+            )
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
         )
 
-    print("✅ Silver Layer Processing completed successfully.")
+    # 4. Save Quarantine Delta Lake
+    if quarantine_count > 0:
+        print(f"💾 Writing Quarantine Delta Lake at: {quarantine_path}...")
+        quarantine_df.write.format("delta").mode("overwrite").save(quarantine_path)
+
+    print("✅ Silver Layer Upsert & Validation complete successfully.")
 
 
 if __name__ == "__main__":
@@ -117,5 +119,10 @@ if __name__ == "__main__":
     QUARANTINE_DELTA_PATH = "data/lakehouse/silver/quarantine_trips"
 
     spark_session = init_spark()
-    process_silver(spark_session, BRONZE_DELTA_PATH, SILVER_DELTA_PATH, QUARANTINE_DELTA_PATH)
+    process_silver(
+        spark_session,
+        BRONZE_DELTA_PATH,
+        SILVER_DELTA_PATH,
+        QUARANTINE_DELTA_PATH,
+    )
     spark_session.stop()
