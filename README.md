@@ -1,4 +1,4 @@
-# TO-Lakehouse: Municipal Telemetry Medallion Architecture
+# TO-Lakehouse: Municipal Medallion Architecture
 
 A production-style 3-tier **Medallion Data Lakehouse** (Bronze $\rightarrow$ Silver $\rightarrow$ Gold) processing over **550,000+ transactional ridership records** from the City of Toronto Open Data platform using **PySpark, Structured Streaming, Delta Lake, and DuckDB**.
 
